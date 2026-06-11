@@ -1,0 +1,1551 @@
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image, ImageTk
+from keras.models import load_model
+from Feature_Extraction.Inception_features import InceptionVs_features
+from Feature_Extraction.HDE_TP import Hybrid_depth_enabled_textural_pattern
+from Feature_Extraction.FCM_BSD import Fused_color_map_based_struct_des
+from Feature_Extraction.MA_FPVT import Mixed_Attention_Fused_ViT
+# from ROI_E import ROI_Extraction
+from rembg import remove
+import matplotlib.pyplot as plt
+from termcolor import cprint
+import os
+import shutil
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import ast
+from pathlib import Path
+
+
+def draw_text_without_overlap(image, text, x, y, used_positions):
+    """
+    Draw text near object without overlapping.
+    """
+
+    h, w = image.shape[:2]
+
+    # Candidate positions
+    candidate_positions = [
+        (x, y - 10),  # top
+        (x, y + 25),  # bottom
+        (x - 60, y),  # left
+        (x + 10, y)  # right
+    ]
+
+    for tx, ty in candidate_positions:
+
+        overlap = False
+
+        for px, py in used_positions:
+
+            if abs(tx - px) < 80 and abs(ty - py) < 30:
+                overlap = True
+                break
+
+        if not overlap:
+            tx = max(5, min(tx, w - 120))
+            ty = max(20, min(ty, h - 10))
+
+            # Background rectangle
+            cv2.rectangle(
+                image,
+                (tx - 2, ty - 18),
+                (tx + 120, ty + 5),
+                (0, 0, 0),
+                -1
+            )
+
+            # Text
+            cv2.putText(
+                image,
+                text,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA
+            )
+
+            used_positions.append((tx, ty))
+            return image
+
+    return image
+
+
+def extract_each_class_object(
+        image_path,
+        DB1,
+        mask_path=None,
+        save_dir=None,
+        display=True
+):
+    if DB1 == "Food_Calorie":
+
+        if not mask_path:
+            splitted = image_path.split("/")
+            current = Path(image_path).stem
+            # dot = splitted[-1].split(".")
+            # current = [item.replace("jpg", "") for item in dot]
+            # current = "".join(current)
+            create_path = current + ".png"
+            set_path = os.path.join("New_Dataset/masks/", create_path)
+            mask_path = set_path
+        img1 = cv2.imread(image_path)
+        img1 = cv2.resize(img1, dsize=(224, 224))
+        mask = cv2.imread(mask_path, 0)
+
+        if img1 is None:
+            raise Exception("Image not found")
+
+        if mask is None:
+            raise Exception("Mask not found")
+
+        H, W = img1.shape[:2]
+
+        mask = cv2.resize(
+            mask,
+            (W, H),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        mask = mask.astype(np.uint8)
+
+        unique_csv = pd.read_csv(
+            "Calories/mask_unique_values.csv"
+        )
+
+        calorie_df = pd.read_csv(
+            "Calories/Dataset2.csv"
+        )
+
+        calorie_df["Food_Name"] = (
+            calorie_df["Food_Name"]
+            .astype(str)
+        )
+
+        matched_row = unique_csv[
+            unique_csv["Image_Path"].str.contains(
+                mask_path.split("\\")[-1].split("/")[-1],
+                case=False,
+                na=False
+            )
+        ]
+
+        if len(matched_row) == 0:
+            raise Exception(
+                "Mask path not found in csv"
+            )
+
+        unique_values = matched_row.iloc[0][
+            "Unique_Values"
+        ]
+
+        unique_values = ast.literal_eval(
+            unique_values
+        )
+
+        semantic_mask = np.zeros_like(img1)
+
+        dark_colors = [
+            (50, 50, 180),
+            (50, 180, 50),
+            (180, 50, 50),
+            (120, 50, 180),
+            (180, 120, 50),
+            (50, 180, 180),
+            (180, 50, 180),
+            (100, 100, 220),
+            (220, 100, 100),
+        ]
+
+        detected_foods = []
+
+        color_idx = 0
+
+        placed_boxes = []
+
+        for val in unique_values:
+
+            if val == 0:
+                continue
+
+            binary_mask = np.zeros(
+                (H, W),
+                dtype=np.uint8
+            )
+
+            binary_mask[mask == val] = 255
+
+            area_pixels = cv2.countNonZero(
+                binary_mask
+            )
+
+            if area_pixels < 1200:
+                continue
+
+            estimated_volume = round(
+                area_pixels * 0.00005,
+                2
+            )
+
+            food_row = calorie_df[
+                calorie_df["Class_ID"] == val
+                ]
+
+            if len(food_row) > 0:
+
+                food_name = str(
+                    food_row.iloc[0]["Food_Name"]
+                )
+
+                calories = float(
+                    food_row.iloc[0]["Calories"]
+                )
+
+            else:
+
+                food_name = "Unknown"
+
+                calories = 0
+
+            color = dark_colors[
+                color_idx % len(dark_colors)
+                ]
+
+            color_idx += 1
+
+            semantic_mask[
+                binary_mask == 255
+                ] = color
+
+            contours, _ = cv2.findContours(
+                binary_mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if len(contours) == 0:
+                continue
+
+            largest = max(
+                contours,
+                key=cv2.contourArea
+            )
+
+            area = cv2.contourArea(largest)
+
+            if area < 1200:
+                continue
+
+            x, y, w, h = cv2.boundingRect(
+                largest
+            )
+
+            if food_name.lower() == "unknown":
+                continue
+
+            label = (
+                f"{food_name} | "
+                f"{estimated_volume:.1f} g | "
+                f"{(calories / 100) * estimated_volume:.1f} kcal"
+            )
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            font_scale = 0.60
+
+            thickness = 2
+
+            text_size = cv2.getTextSize(
+                label,
+                font,
+                font_scale,
+                thickness
+            )[0]
+
+            text_w = text_size[0]
+            text_h = text_size[1]
+
+            box_w = text_w + 20
+            box_h = text_h + 20
+
+            # -----------------------------------
+            # INITIAL TEXT POSITION
+            # -----------------------------------
+
+            text_x = x
+            text_y = y - 15
+
+            # if top space not available
+            # place at bottom
+            if text_y < box_h:
+                text_y = y + h + box_h
+
+            # keep inside width
+            if text_x + box_w > W:
+                text_x = W - box_w - 10
+
+            if text_x < 10:
+                text_x = 10
+
+            # -----------------------------------
+            # AVOID OVERLAP
+            # -----------------------------------
+
+            overlap = True
+
+            while overlap:
+
+                overlap = False
+
+                for px1, py1, px2, py2 in placed_boxes:
+
+                    if (
+                            text_x < px2 and
+                            text_x + box_w > px1 and
+                            text_y - box_h < py2 and
+                            text_y > py1
+                    ):
+                        text_y += 45
+                        overlap = True
+
+            # -----------------------------------
+            # KEEP LABEL INSIDE IMAGE
+            # -----------------------------------
+
+            # if label goes below image
+            # move it upward
+            if text_y + 10 > H:
+
+                text_y = y - 20
+
+                # if still outside
+                if text_y - box_h < 0:
+                    text_y = H - box_h - 10
+
+            # -----------------------------------
+            # BACKGROUND BOX
+            # -----------------------------------
+
+            bg_x1 = text_x - 8
+            bg_y1 = text_y - text_h - 12
+
+            bg_x2 = text_x + text_w + 10
+            bg_y2 = text_y + 8
+
+            # final clipping
+            bg_x1 = max(bg_x1, 0)
+            bg_y1 = max(bg_y1, 0)
+
+            bg_x2 = min(bg_x2, W - 1)
+            bg_y2 = min(bg_y2, H - 1)
+
+            placed_boxes.append(
+                (bg_x1, bg_y1, bg_x2, bg_y2)
+            )
+
+            # -----------------------------------
+            # DRAW BLACK BACKGROUND
+            # -----------------------------------
+
+            # cv2.rectangle(
+            #     semantic_mask,
+            #     (bg_x1, bg_y1),
+            #     (bg_x2, bg_y2),
+            #     (0, 0, 0),
+            #     -1
+            # )
+
+            # white border
+            # cv2.rectangle(
+            #     semantic_mask,
+            #     (bg_x1, bg_y1),
+            #     (bg_x2, bg_y2),
+            #     (255, 255, 255),
+            #     2
+            # )
+
+            # white text
+            # cv2.putText(
+            #     semantic_mask,
+            #     label,
+            #     (text_x, text_y),
+            #     font,
+            #     font_scale,
+            #     (255, 255, 255),
+            #     thickness,
+            #     cv2.LINE_AA
+            # )
+
+            detected_foods.append({
+                "food_name": food_name,
+                "calories": calories,
+                "volume": estimated_volume
+            })
+
+        # -----------------------------------
+        # FIRST BLEND IMAGE + SEGMENTATION
+        # -----------------------------------
+
+        # -----------------------------------
+        # BLEND IMAGE + SEGMENTATION
+        # -----------------------------------
+
+        segmented_output = cv2.addWeighted(
+            img1,
+            0.65,
+            semantic_mask,
+            0.35,
+            0
+        )
+
+        # -----------------------------------
+        # DRAW LABELS PERFECTLY
+        # -----------------------------------
+
+        # -----------------------------------
+        # DRAW CLEAN LABELS
+        # -----------------------------------
+
+        used_regions = []
+
+        for val in unique_values:
+
+            if val == 0:
+                continue
+
+            binary_mask = np.zeros(
+                (H, W),
+                dtype=np.uint8
+            )
+
+            binary_mask[mask == val] = 255
+
+            area_pixels = cv2.countNonZero(
+                binary_mask
+            )
+
+            if area_pixels < 1200:
+                continue
+
+            food_row = calorie_df[
+                calorie_df["Class_ID"] == val
+                ]
+
+            if len(food_row) == 0:
+                continue
+
+            food_name = str(
+                food_row.iloc[0]["Food_Name"]
+            )
+
+            calories = float(
+                food_row.iloc[0]["Calories"]
+            )
+
+            estimated_volume = round(
+                area_pixels * 0.005,
+                2
+            )
+
+            contours, _ = cv2.findContours(
+                binary_mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if len(contours) == 0:
+                continue
+
+            largest = max(
+                contours,
+                key=cv2.contourArea
+            )
+
+            x, y, w, h = cv2.boundingRect(
+                largest
+            )
+
+            # -----------------------------------
+            # SHORT LABEL
+            # -----------------------------------
+
+            label = (
+                f"{food_name} | "
+                f"{estimated_volume}g | "
+                f"{(calories / 100) * estimated_volume:.0f} kcal"
+            )
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            font_scale = 0.25
+
+            thickness = 1
+
+            text_size = cv2.getTextSize(
+                label,
+                font,
+                font_scale,
+                thickness
+            )[0]
+
+            text_w = text_size[0]
+            text_h = text_size[1]
+
+            padding = 3
+
+            # -----------------------------------
+            # PLACE ABOVE FOOD
+            # -----------------------------------
+
+            center_x = x + w // 2
+
+            text_x = center_x - text_w // 2
+
+            text_y = y - 8
+
+            # if top unavailable
+            if text_y - text_h < 0:
+                text_y = y + h + text_h + 8
+
+            # keep inside image
+            text_x = max(5, text_x)
+
+            if text_x + text_w > W:
+                text_x = W - text_w - 5
+
+            # -----------------------------------
+            # SMALL OVERLAP HANDLING
+            # -----------------------------------
+
+            moved = True
+
+            while moved:
+
+                moved = False
+
+                for rx1, ry1, rx2, ry2 in used_regions:
+
+                    if (
+                            text_x < rx2 and
+                            text_x + text_w > rx1 and
+                            text_y - text_h < ry2 and
+                            text_y > ry1
+                    ):
+                        text_y += text_h + 10
+                        moved = True
+
+            # -----------------------------------
+            # FINAL BOX
+            # -----------------------------------
+
+            bg_x1 = text_x - padding
+            bg_y1 = text_y - text_h - padding
+
+            bg_x2 = text_x + text_w + padding
+            bg_y2 = text_y + padding
+
+            used_regions.append(
+                (bg_x1, bg_y1, bg_x2, bg_y2)
+            )
+
+            # black background
+            cv2.rectangle(
+                segmented_output,
+                (bg_x1, bg_y1),
+                (bg_x2, bg_y2),
+                (0, 0, 0),
+                -1
+            )
+
+            # text
+            cv2.putText(
+                segmented_output,
+                label,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA
+            )
+
+        return segmented_output
+
+    if DB1 == "nutrition5k":
+
+        dish_ingredients = pd.read_csv(
+            "Dataset/nutition5K/dish_ingredients.csv"
+        )
+
+        img = cv2.imread(image_path)
+
+        if img is None:
+            raise ValueError("Image not found")
+
+        original = img.copy()
+
+        dish_id = os.path.basename(
+            os.path.dirname(image_path)
+        )
+
+        ingredient_rows = dish_ingredients[
+            dish_ingredients["dish_id"] == dish_id
+            ]
+
+        ingredient_info = []
+
+        for idx, row in ingredient_rows.iterrows():
+            ingr_name = str(row["ingr_name"])
+
+            calories = float(row["calories"])
+
+            grams = float(row["grams"])
+
+            ingredient_info.append({
+                "name": ingr_name,
+                "calories": calories,
+                "weight": grams
+            })
+
+        gray = cv2.cvtColor(
+            original,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        blur = cv2.GaussianBlur(
+            gray,
+            (7, 7),
+            0
+        )
+
+        _, thresh = cv2.threshold(
+            blur,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+
+        kernel = np.ones((5, 5), np.uint8)
+
+        morph = cv2.morphologyEx(
+            thresh,
+            cv2.MORPH_OPEN,
+            kernel,
+            iterations=2
+        )
+
+        morph = cv2.morphologyEx(
+            morph,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=4
+        )
+
+        contours, _ = cv2.findContours(
+            morph,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        h_img, w_img = original.shape[:2]
+
+        center_x = w_img // 2
+        center_y = h_img // 2
+
+        semantic_overlay = np.zeros_like(original)
+
+        dark_colors = [
+            (25, 60, 180),
+            (40, 140, 60),
+            (180, 70, 50),
+            (140, 50, 160),
+            (50, 160, 160),
+            (180, 130, 50),
+            (100, 60, 200),
+            (60, 120, 220),
+            (180, 60, 120),
+            (70, 180, 100)
+        ]
+
+        filtered_contours = []
+
+        image_area = h_img * w_img
+
+        # ---------- detect plate region ----------
+        gray_plate = cv2.cvtColor(
+            original,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        plate_blur = cv2.GaussianBlur(
+            gray_plate,
+            (9, 9),
+            0
+        )
+
+        circles = cv2.HoughCircles(
+            plate_blur,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=300,
+            param1=100,
+            param2=40,
+            minRadius=180,
+            maxRadius=420
+        )
+
+        plate_center_x = w_img // 2
+        plate_center_y = h_img // 2
+        plate_radius = min(h_img, w_img) // 3
+
+        if circles is not None:
+            circles = np.uint16(
+                np.around(circles)
+            )
+
+            largest_circle = max(
+                circles[0],
+                key=lambda c: c[2]
+            )
+
+            plate_center_x = largest_circle[0]
+            plate_center_y = largest_circle[1]
+            plate_radius = largest_circle[2]
+
+        # ---------- contour filtering ----------
+        for cnt in contours:
+
+            area = cv2.contourArea(cnt)
+
+            if area < 1200:
+                continue
+
+            if area > image_area * 0.20:
+                continue
+
+            x1, y1, w1, h1 = cv2.boundingRect(cnt)
+
+            # remove border touching objects
+            if (
+                    x1 <= 10 or
+                    y1 <= 10 or
+                    x1 + w1 >= w_img - 10 or
+                    y1 + h1 >= h_img - 10
+            ):
+                continue
+
+            aspect_ratio = w1 / (h1 + 1e-5)
+
+            if aspect_ratio > 4:
+                continue
+
+            if aspect_ratio < 0.25:
+                continue
+
+            cx = x1 + w1 // 2
+            cy = y1 + h1 // 2
+
+            # distance from plate center
+            distance = np.sqrt(
+                (cx - plate_center_x) ** 2 +
+                (cy - plate_center_y) ** 2
+            )
+
+            # keep only inside plate
+            if distance > plate_radius * 0.82:
+                continue
+
+            # remove tray/frame regions
+            if w1 > w_img * 0.55:
+                continue
+
+            if h1 > h_img * 0.55:
+                continue
+
+            filtered_contours.append(cnt)
+
+        filtered_contours = sorted(
+            filtered_contours,
+            key=lambda c: cv2.boundingRect(c)[1]
+        )
+
+        for idx, cnt in enumerate(filtered_contours):
+            color = dark_colors[
+                idx % len(dark_colors)
+                ]
+
+            smooth_mask = np.zeros(
+                (h_img, w_img),
+                dtype=np.uint8
+            )
+
+            cv2.drawContours(
+                smooth_mask,
+                [cnt],
+                -1,
+                255,
+                thickness=cv2.FILLED
+            )
+
+            smooth_mask = cv2.GaussianBlur(
+                smooth_mask,
+                (15, 15),
+                0
+            )
+
+            colored_region = np.zeros_like(original)
+
+            colored_region[:] = color
+
+            semantic_overlay = np.where(
+                smooth_mask[:, :, np.newaxis] > 0,
+                colored_region,
+                semantic_overlay
+            )
+
+        segmented_output = cv2.addWeighted(
+            original,
+            0.45,
+            semantic_overlay,
+            0.55,
+            0
+        )
+
+        placed_boxes = []
+
+        for idx, cnt in enumerate(filtered_contours):
+
+            # if prediction not available skip text
+            if idx >= len(ingredient_info):
+                continue
+
+            x1, y1, w1, h1 = cv2.boundingRect(cnt)
+
+            food_name = ingredient_info[idx]["name"]
+
+            calories = ingredient_info[idx]["calories"]
+
+            weight = ingredient_info[idx]["weight"]
+
+            # skip unknown class
+            if str(food_name).lower() == "unknown":
+                continue
+
+            label = (
+                f"{food_name} | "
+                f"{weight:.1f} g | "
+                f"{calories:.1f} kcal"
+            )
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            font_scale = 0.60
+
+            thickness = 2
+
+            text_size = cv2.getTextSize(
+                label,
+                font,
+                font_scale,
+                thickness
+            )[0]
+
+            text_w = text_size[0]
+            text_h = text_size[1]
+
+            box_w = text_w + 20
+            box_h = text_h + 20
+
+            # place label near object
+            text_x = x1
+            text_y = y1 - 15
+
+            if text_y < 35:
+                text_y = y1 + h1 + 30
+
+            if text_x + box_w > w_img:
+                text_x = w_img - box_w - 10
+
+            if text_x < 10:
+                text_x = 10
+
+            overlap = True
+
+            while overlap:
+
+                overlap = False
+
+                for px1, py1, px2, py2 in placed_boxes:
+
+                    if (
+                            text_x < px2 and
+                            text_x + box_w > px1 and
+                            text_y - box_h < py2 and
+                            text_y > py1
+                    ):
+                        text_y += 40
+                        overlap = True
+
+            if text_y > h_img - 10:
+                text_y = h_img - 10
+
+            bg_x1 = text_x - 8
+            bg_y1 = text_y - text_h - 12
+
+            bg_x2 = text_x + text_w + 10
+            bg_y2 = text_y + 8
+
+            placed_boxes.append(
+                (bg_x1, bg_y1, bg_x2, bg_y2)
+            )
+
+            cv2.rectangle(
+                segmented_output,
+                (bg_x1, bg_y1),
+                (bg_x2, bg_y2),
+                (0, 0, 0),
+                -1
+            )
+
+            cv2.rectangle(
+                segmented_output,
+                (bg_x1, bg_y1),
+                (bg_x2, bg_y2),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                segmented_output,
+                label,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness
+            )
+
+        return segmented_output
+
+
+def crop_object_from_white_background(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if len(contours) == 0:
+        raise ValueError("No object detected!")
+
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    x, y, w, h = cv2.boundingRect(largest_contour)
+
+    cropped = image[y:y + h, x:x + w]
+
+    # Four corner points
+    top_left = (x, y)
+    top_right = (x + w, y)
+    bottom_left = (x, y + h)
+    bottom_right = (x + w, y + h)
+
+    # print("Corner Points:")
+    # print("Top Left:", top_left)
+    # print("Top Right:", top_right)
+    # print("Bottom Left:", bottom_left)
+    # print("Bottom Right:", bottom_right)
+
+    # Save cropped image
+    # cv2.imwrite(output_path, cropped)
+
+    return cropped
+
+
+def ROI_Extraction(img):
+    if img.max() <= 1.0:
+        img = (img * 255).astype(np.uint8)
+    else:
+        img = img.astype(np.uint8)
+    cur_img = img
+
+    removed = remove(cur_img)
+
+    removed = cv2.cvtColor(removed, cv2.COLOR_RGBA2GRAY)
+
+    _, threshold = cv2.threshold(removed, 60, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(threshold, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    # largest = np.vstack((contours[0], contours[2]))
+    largest = contours[1]
+
+    x, y, w, h = cv2.boundingRect(largest)
+
+    get_out = cur_img[y:y + h, x:x + w]
+
+    removed2 = remove(get_out)
+
+    # roi_gray = cv2.cvtColor(removed2, cv2.COLOR_RGBA2GRAY)
+    #
+    # _, threshold2 = cv2.threshold(roi_gray, 50, 255, cv2.THRESH_BINARY_INV)
+    #
+    # con2, _ = cv2.findContours(threshold2, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # mask2 = np.zeros(threshold2.shape, dtype=np.uint8)
+    # for cnt in con2:
+    #
+    #     area = cv2.contourArea(cnt)
+    #
+    #     # Ignore tiny noise
+    #     if area > 50:
+    #         cv2.drawContours(
+    #             mask2,
+    #             [cnt],
+    #             -1,
+    #             255,
+    #             thickness=cv2.FILLED
+    #         )
+    # kernel = np.ones((7, 7), np.uint8)
+    # mask2 = cv2.morphologyEx(
+    #     mask2,
+    #     cv2.MORPH_CLOSE,
+    #     kernel
+    # )
+    removed2 = remove(get_out)
+
+    # If RGBA
+    if len(removed2.shape) == 3:
+
+        alpha = removed2[:, :, 3]
+
+    # If already grayscale
+    else:
+
+        alpha = removed2
+
+    # Binary mask
+    mask = alpha > 0
+
+    # Output image
+    result = np.zeros_like(get_out)
+
+    # Apply mask
+    result[mask] = get_out[mask]
+
+    # Coordinates
+    ys, xs = np.where(mask)
+
+    # Bounding box
+    x1 = np.min(xs)
+    x2 = np.max(xs)
+
+    y1 = np.min(ys)
+    y2 = np.max(ys)
+
+    # Final ROI
+    get_out1 = get_out[y1:y2, x1:x2]
+    # con2 = sorted(con2, key=cv2.contourArea, reverse=True)
+    #
+    # largest1 = con2[0]
+    # x1, y1, w1, h1 = cv2.boundingRect(largest1)
+    #
+    # get_out1 = get_out[y1:y1 + h1, x1:x1 + w1]
+    # for j in con2:
+    #     x, y, w, h = cv2.boundingRect(j)
+    #     new_img = get_out[y:y + h, x:x + w]
+    #     # new_drawn = cv2.drawContours(cur_img, i, -1, (0, 255, 0), 2)
+    #     plt.imshow(new_img)
+    #     plt.pause(1)
+    #     plt.close()
+    # drawn_image = cv2.drawContours(get_out1, [largest1], -1, (0, 255, 0), 2)
+
+    return get_out1
+
+
+def ROI_Extraction_1(img_):
+    # cprint("====================================", color="yellow")
+    # cprint("Extracting ROI.", color="green")
+    # cprint("====================================", color="yellow")
+
+    # Remove background
+    # if DB == "Food_Calorie":
+    img_ = remove(img_)
+
+    # Ensure image has alpha
+    if img_.shape[2] != 4:
+        print("No alpha channel found")
+        return img_, (0, 0, img_.shape[1], img_.shape[0])
+
+    # Alpha channel
+    alpha = img_[:, :, 3]
+
+    # Binary mask from alpha
+    _, thresh = cv2.threshold(alpha, 1, 255, cv2.THRESH_BINARY)
+
+    # Optional cleanup
+    kernel = np.ones((3, 3), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    # Find contours
+    contours, _ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if len(contours) == 0:
+        return img_, (0, 0, img_.shape[1], img_.shape[0])
+
+    # Largest contour
+    contour = max(contours, key=cv2.contourArea)
+
+    # Bounding rectangle
+    x, y, w, h = cv2.boundingRect(contour)
+
+    # Crop ROI
+    roi = img_[y:y + h, x:x + w]
+    roi = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+    roi1 = cv2.resize(roi, dsize=(224, 224))
+    return roi1
+
+
+root = tk.Tk()
+root.title("Food Segmentation")
+root.geometry("900x650")
+root.config(bg="#0b1120")
+root.resizable(False, False)
+
+DB = None
+data = None
+preprocess = None
+
+title = tk.Label(
+    root,
+    text="FOOD SEGMENTATION & CALORIE ANALYSIS",
+    font=("Helvetica", 28, "bold"),
+    bg="#0b1120",
+    fg="#38bdf8"
+)
+title.pack(pady=20)
+
+subtitle = tk.Label(
+    root,
+    text="",
+    font=("Arial", 13, "italic"),
+    bg="#0b1120",
+    fg="#cbd5e1"
+)
+subtitle.pack()
+
+top_frame = tk.Frame(root, bg="#0b1120")
+top_frame.pack(pady=25)
+
+middle_frame = tk.Frame(root, bg="#0b1120")
+middle_frame.pack(pady=10)
+
+bottom_frame = tk.Frame(root, bg="#0b1120")
+bottom_frame.pack(pady=20)
+
+
+def button_hover(e):
+    e.widget["bg"] = "#0284c7"
+
+
+def button_leave(e):
+    e.widget["bg"] = e.widget.default_bg
+
+
+def create_button(parent, text, command, color):
+    btn = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        font=("Arial", 7, "bold"),
+        bg=color,
+        fg="white",
+        activebackground="#0284c7",
+        activeforeground="white",
+        width=20,
+        height=2,
+        bd=0,
+        cursor="hand2"
+    )
+
+    btn.default_bg = color
+
+    btn.bind("<Enter>", button_hover)
+    btn.bind("<Leave>", button_leave)
+
+    return btn
+
+
+place_hold_org = tk.Frame(
+    bottom_frame,
+    width=250,
+    height=250,
+    bg="#111827",
+    highlightbackground="#38bdf8",
+    highlightthickness=3
+)
+
+place_hold_org.pack()
+place_hold_org.pack_propagate(False)
+
+image_label = tk.Label(place_hold_org, bg="#111827")
+image_label.place(relx=0.5, rely=0.5, anchor="center")
+
+welcome_label = tk.Label(
+    place_hold_org,
+    text="IMAGE DISPLAY AREA",
+    font=("Arial", 24, "bold"),
+    bg="#111827",
+    fg="#64748b"
+)
+
+welcome_label.place(relx=0.5, rely=0.5, anchor="center")
+
+status_label = tk.Label(
+    root,
+    text="Welcome to AI Food Segmentation System",
+    font=("Arial", 12, "bold"),
+    bg="#0b1120",
+    fg="#22c55e"
+)
+
+status_label.pack(pady=10)
+
+
+def update_status(msg):
+    status_label.config(text=msg)
+
+
+def show_image(frame):
+    global image_label
+
+    welcome_label.place_forget()
+
+    # Display area size
+    display_w = 250
+    display_h = 250
+
+    h, w = frame.shape[:2]
+
+    # Calculate scaling factor
+    scale = min(display_w / w, display_h / h)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    frame = cv2.resize(frame, (new_w, new_h))
+
+    # Convert BGR -> RGB
+    if len(frame.shape) == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    image = Image.fromarray(frame)
+    photo = ImageTk.PhotoImage(image)
+
+    image_label.config(image=photo)
+    image_label.image = photo
+
+    image_label.place(
+        relx=0.5,
+        rely=0.5,
+        anchor="center"
+    )
+
+
+def Preprocessing(img):
+    if DB == "Food_Calorie":
+        cropped_img = ROI_Extraction(img)
+    else:
+        cropped_img = ROI_Extraction(img)
+    # Handle channel conversion safely
+    if len(cropped_img.shape) == 3:
+
+        if cropped_img.shape[2] == 4:
+            cropped_img = cv2.cvtColor(
+                cropped_img,
+                cv2.COLOR_BGRA2BGR
+            )
+
+        elif cropped_img.shape[2] == 3:
+            cropped_img = cropped_img.copy()
+
+    lab = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2LAB)
+
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+
+    cl = clahe.apply(l)
+
+    limg = cv2.merge((cl, a, b))
+
+    clahe_rgb = cv2.cvtColor(
+        limg,
+        cv2.COLOR_LAB2BGR
+    )
+
+    return clahe_rgb
+
+
+def load_DB1():
+    global DB
+
+    try:
+        load_model("Saved_models/Model1.h5")
+    except:
+        pass
+
+    DB = "Food_Calorie"
+
+    update_status("Food_Calorie Model Loaded Successfully")
+
+
+def Load_DB2():
+    global DB
+
+    try:
+        load_model("Saved_models/Model2.h5")
+    except:
+        pass
+
+    DB = "nutrition5k"
+
+    update_status("nutrition5k Model Loaded Successfully")
+
+
+def Load_image():
+    global data, filename
+
+    filename = filedialog.askopenfilename(
+        filetypes=[("Image Files", "*.jpg *.png *.jpeg")], initialdir="Test_data/"
+    )
+
+    if filename:
+        data = cv2.imread(filename)
+
+        show_image(data)
+
+        update_status("Image Loaded Successfully")
+
+
+def Preprocessing_fn():
+    global preprocess
+
+    preprocess = Preprocessing(data)
+
+    show_image(preprocess)
+
+    update_status("Preprocessing Completed")
+
+
+def Hybrid_depth_enabled_Textural_pattern_fn():
+    global Feature3
+
+    Feature3 = Hybrid_depth_enabled_textural_pattern(preprocess)
+
+    show_image(Feature3)
+
+    update_status("Hybrid Depth Enabled Texture Extracted")
+
+
+def InceptionVs_features_FUN():
+    global Inception_feat
+
+    Inception_feat = InceptionVs_features(preprocess)
+
+    temp = cv2.normalize(
+        Inception_feat,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    temp = cv2.applyColorMap(temp, cv2.COLORMAP_JET)
+
+    show_image(temp)
+
+    update_status("Inception V3 Features Extracted")
+
+
+def Fused_color_map_based_struct_des_fun():
+    global feature4, preprocess
+    preprocess = cv2.resize(preprocess, dsize=(256, 256))
+    feature4 = Fused_color_map_based_struct_des(preprocess)
+
+    temp = cv2.normalize(
+        feature4,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
+
+    temp = temp.astype(np.uint8)
+
+    show_image(temp)
+
+    update_status("FCM BSD Features Extracted")
+
+
+def Mixed_Attention_Fused_ViT_fun():
+    global feature2
+
+    feature2 = Mixed_Attention_Fused_ViT(preprocess)
+
+    temp = cv2.normalize(
+        feature2,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
+
+    temp = temp.astype(np.uint8)
+
+    show_image(temp)
+
+    update_status("Mixed Attention ViT Features Extracted")
+
+
+def segmented_output_fn():
+    global seg
+
+    # if DB == "nutrition5k":
+    seg = extract_each_class_object(filename, DB)
+    # else:
+    seg = extract_each_class_object(filename, DB)
+
+    show_image(seg)
+
+    update_status("Segmentation Completed Successfully")
+
+
+def estimate_calorie():
+    calorie_dict = None
+    if DB == "Tray_Food_Segmentation":
+        l = pd.read_csv("Calories/Dataset1.csv")
+
+        l["_name"] = l["_name"].str.strip().str.lower()
+
+        calorie_dict = dict(zip(l["_name"], l["calories_per_gram"]))
+    else:
+        l = pd.read_csv("Calories/Dataset2.csv")
+
+        l["label"] = l["label"].str.strip().str.lower()
+
+        calorie_dict = dict(zip(l["label"], l["calories_per_gram"]))
+
+    final_img, percentage11 = extract_each_class_object(filename, DB, )
+
+    show_image(final_img)
+
+
+btn1 = create_button(
+    top_frame,
+    "Load Food_Calorie Model",
+    load_DB1,
+    "#16a34a"
+)
+
+btn1.grid(row=0, column=0, padx=6, pady=10)
+
+btn2 = create_button(
+    top_frame,
+    "Load nutrition5k Model",
+    Load_DB2,
+    "#2563eb"
+)
+
+btn2.grid(row=0, column=1, padx=6, pady=6)
+
+btn3 = create_button(
+    top_frame,
+    "Select Image",
+    Load_image,
+    "#9333ea"
+)
+
+btn3.grid(row=0, column=2, padx=6, pady=6)
+
+btn4 = create_button(
+    middle_frame,
+    "Preprocessing",
+    Preprocessing_fn,
+    "#ea580c"
+)
+
+btn4.grid(row=0, column=0, padx=6, pady=6)
+
+btn5 = create_button(
+    middle_frame,
+    "Fused Color Map BSD",
+    Fused_color_map_based_struct_des_fun,
+    "#0f766e"
+)
+
+btn5.grid(row=0, column=1, padx=6, pady=6)
+
+btn6 = create_button(
+    middle_frame,
+    "Hybrid Depth Texture",
+    Hybrid_depth_enabled_Textural_pattern_fn,
+    "#db2777"
+)
+
+btn6.grid(row=0, column=2, padx=6, pady=10)
+
+btn7 = create_button(
+    middle_frame,
+    "Inception V3 Features",
+    InceptionVs_features_FUN,
+    "#7c3aed"
+)
+
+btn7.grid(row=0, column=3, padx=6, pady=10)
+
+btn8 = create_button(
+    middle_frame,
+    "Mixed Attention ViT",
+    Mixed_Attention_Fused_ViT_fun,
+    "#0284c7"
+)
+
+btn8.grid(row=1, column=1, padx=6, pady=6)
+
+btn9 = create_button(
+    middle_frame,
+    "SEGMENT IMAGE",
+    segmented_output_fn,
+    "#dc2626"
+)
+
+btn9.grid(row=0, column=5, padx=6, pady=6)
+
+# btn10 = create_button(
+#     middle_frame,
+#     "CALORIE EST",
+#     estimate_calorie,
+#     "#dc2626"
+# )
+
+# btn10.grid(row=1, column=2, padx=12, pady=10)
+
+root.mainloop()
